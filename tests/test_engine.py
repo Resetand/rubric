@@ -16,7 +16,6 @@ ignore_accounts = ["Service"]
 [[transfer]]
 name = "roundups"
 to_account = "Savings"
-keep_target_balance = true
 [transfer.match]
 account = "Card"
 kind = "expense"
@@ -158,12 +157,12 @@ def test_cashback_of_the_same_amount_is_not_a_refund(rules):
 
 # --- roundups ----------------------------------------------------------------------------------------------------------
 
-def test_roundup_becomes_a_transfer_and_keeps_the_savings_balance(rules):
+def test_roundup_becomes_a_transfer_that_adds_it_to_the_savings_and_keeps_the_card(rules):
     roundup = op('2026-10-10', out=37)
     p = plan(rules, op('2026-10-10', out=463, payee='Cafe'), roundup)
     [action] = p.actions
     assert written(p)[roundup['id']]['incomeAccount'] == 'savings'
-    assert engine.balance_deltas(action) == pytest.approx({'card': 0, 'savings': 0})
+    assert engine.balance_deltas(action) == pytest.approx({'card': 0, 'savings': 37})
 
 
 @pytest.mark.parametrize('roundup', [
@@ -233,7 +232,7 @@ def test_operation_handled_by_an_earlier_run_is_not_touched_again(rules):
     assert not plan(rules, op('2026-10-10', out=463, payee='Cafe'), roundup, handled=[roundup['id']]).actions
 
 
-def test_every_action_keeps_every_balance(rules):
+def test_every_action_moves_balances_only_as_it_declares(rules):
     p = plan(rules,
              op('2026-10-10', out=463, payee='Cafe'), op('2026-10-10', out=37),
              op('2026-10-01', out=900, payee='Shop'), op('2026-10-03', inc=900, payee='Shop'),
@@ -241,7 +240,9 @@ def test_every_action_keeps_every_balance(rules):
              op('2026-10-05', out=300, payee='To myself'))
     assert len(p.actions) == 4
     for action in p.actions:
-        assert all(abs(d) < 0.005 for d in engine.balance_deltas(action).values()), action.rule
+        deltas = engine.balance_deltas(action)
+        assert all(abs(deltas[a] - action.moves.get(a, 0)) < 0.005 for a in deltas), action.rule
+    assert sum(sum(a.moves.values()) for a in p.actions) == pytest.approx(37)   # only the roundup reaches the savings
 
 
 def test_large_self_transfer_is_reported_once(rules):

@@ -34,7 +34,6 @@ class TransferRule:
     name: str
     match: Match
     to_account: str
-    keep_target_balance: bool = False     # the bank already counts the money in the target balance
     settle_days: int | None = None
 
 

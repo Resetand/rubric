@@ -9,7 +9,9 @@ Safety rules that hold for every rule type:
 - a transaction is looked at only after `settle_days` and within `lookback_days`;
 - an expense or income with a counterpart of the same amount on another own account nearby is one leg of an
   unmerged transfer: Zenmoney merges those itself, no rule touches either leg;
-- every action keeps every account balance as it is (checked here, an action that would move a balance is a bug).
+- an action changes balances only as it declares in `moves`: a transfer rule adds to its target account exactly the
+  money the bank already moved there and the plugin did not record (a T-Bank roundup comes as a card expense only);
+  every other balance stays as it is. Checked here: anything else is a bug.
 """
 import re
 from collections import defaultdict
@@ -95,7 +97,7 @@ class Action:
     text: str
     before: list[dict]
     after: list[dict]
-    start_balance_deltas: dict[str, float] = field(default_factory=dict)   # account id -> startBalance delta
+    moves: dict[str, float] = field(default_factory=dict)   # account id -> balance change the action is meant to make
 
 
 @dataclass
@@ -270,12 +272,11 @@ class _Planner:
                 raise ConfigError(f'{rule.name}: {rule.to_account!r} is in another currency')
             if kind(t) == 'expense':
                 after = dict(t, incomeAccount=target, income=t['outcome'], incomeInstrument=t['outcomeInstrument'], tag=None)
-                delta = -t['outcome']
+                move = t['outcome']
             else:
                 after = dict(t, outcomeAccount=target, outcome=t['income'], outcomeInstrument=t['incomeInstrument'], tag=None)
-                delta = t['income']
-            self.add_action(Action(rule.name, self.describe(t), [t], [after],
-                            {target: delta} if rule.keep_target_balance else {}))
+                move = -t['income']
+            self.add_action(Action(rule.name, self.describe(t), [t], [after], {target: move}))
 
     def refund(self, rule: RefundRule):
         refunds = [t for t in self.book.transactions if kind(t) == 'income' and counterparty(t) and self.eligible(t, rule.settle_days)
@@ -341,7 +342,8 @@ def _words(name: str) -> set[str]:
 
 
 def balance_deltas(action: Action) -> dict[str, float]:
-    deltas = defaultdict(float, action.start_balance_deltas)
+    """How writing the action changes the balance of each account."""
+    deltas = defaultdict(float)
     for sign, ts in ((-1, action.before), (1, action.after)):
         for t in ts:
             if not t.get('deleted'):
@@ -351,6 +353,8 @@ def balance_deltas(action: Action) -> dict[str, float]:
 
 
 def _assert_balances_kept(action: Action):
-    moved = {a: d for a, d in balance_deltas(action).items() if abs(d) >= CENT}
-    if moved:
-        raise PlanError(f'{action.rule}: {action.text} would move balances {moved}')
+    deltas = balance_deltas(action)
+    wrong = {a: round(deltas.get(a, 0) - action.moves.get(a, 0), 2) for a in set(deltas) | set(action.moves)
+             if abs(deltas.get(a, 0) - action.moves.get(a, 0)) >= CENT}
+    if wrong:
+        raise PlanError(f'{action.rule}: {action.text} would move balances beyond what it declares: {wrong}')

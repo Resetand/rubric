@@ -50,7 +50,7 @@ class App:
                    Path(os.environ.get('AUTOPILOT_DATA', 'data')), ZoneInfo(os.environ.get('AUTOPILOT_TIMEZONE', 'Europe/Moscow')))
 
     # --- state ---------------------------------------------------------------------------------------------------
-    # state.json: {"handled": {id: "rule date"}, "pending": {...} while a start balance compensation is in flight}
+    # state.json: {"handled": {id: "rule date"}}
 
     @contextmanager
     def locked(self):
@@ -61,6 +61,8 @@ class App:
             except BlockingIOError:
                 raise RunError('another autopilot run holds data/.lock') from None
             self.state = self.load_state()
+            if not self.state_path.exists():
+                self.save_state()   # before any journal: a journal without state.json then always means a lost state
             yield
 
     def load_state(self) -> dict:
@@ -103,38 +105,6 @@ class App:
                            'Check `make plan`; if it is right, raise max_writes_per_run for one run.')
         return book, p
 
-    def finish_pending(self, mirror: Mirror):
-        """Complete a start balance compensation interrupted between the two writes of a run.
-
-        Transactions and accounts go in two requests. If the run broke after the first, the converted transactions
-        are no longer candidates for any rule, so the compensation must be finished here or it is lost for good.
-        """
-        pending = self.state.get('pending')
-        if not pending:
-            return
-        live, accounts = mirror.objects['transaction'], mirror.objects['account']
-        landed = [live.get(i, {}).get('incomeAccount') == want['incomeAccount']
-                  and live.get(i, {}).get('outcomeAccount') == want['outcomeAccount']
-                  for i, want in pending['transactions'].items()]
-        fixes = []
-        for account, change in pending['accounts'].items():
-            now = accounts[account]['startBalance']
-            if abs(now - change['to']) < engine.CENT:
-                continue
-            if abs(now - change['from']) >= engine.CENT or (any(landed) and not all(landed)):
-                raise RunError(f'start balance of «{accounts[account]["title"]}» is {now}, expected {change["from"]} or '
-                               f'{change["to"]} (journal {pending["journal"]}): check it by hand, then remove "pending" '
-                               'from data/state.json. Nothing written.')
-            if all(landed):
-                delta = change['to'] - change['from']
-                fixes.append(dict(accounts[account], startBalance=change['to'], balance=round(accounts[account]['balance'] + delta, 2)))
-        if fixes:
-            mirror.apply(self.zen.write(mirror.server_timestamp, account=fixes))
-            mirror.save()
-            self.log(f'finished an interrupted balance compensation from {pending["journal"]}')
-        del self.state['pending']
-        self.save_state()
-
     def apply(self, mirror: Mirror, book: engine.Book, p: engine.Plan) -> list[str]:
         """Write the plan, then read it back. Returns problems found by the check (empty: all as planned)."""
         balances = {a: book.accounts[a]['balance'] for a in book.accounts}
@@ -142,28 +112,8 @@ class App:
         record = {'status': 'writing', 'actions': [vars(a) for a in p.actions]}
         _write_json(journal, record)
 
-        deltas = defaultdict(float)
-        for a in p.actions:
-            for account, delta in a.start_balance_deltas.items():
-                deltas[account] += delta
-        accounts = mirror.objects['account']
-        if deltas:
-            self.state['pending'] = {
-                'journal': journal.name,
-                'accounts': {a: {'from': accounts[a]['startBalance'], 'to': round(accounts[a]['startBalance'] + d, 2)}
-                             for a, d in deltas.items()},
-                'transactions': {o['id']: {'incomeAccount': o['incomeAccount'], 'outcomeAccount': o['outcomeAccount']}
-                                 for a in p.actions if a.start_balance_deltas for o in a.after}}
-            self.save_state()
-
         objects = [o for a in p.actions for o in a.after]
         mirror.apply(self.zen.write(mirror.server_timestamp, transaction=objects))
-        if deltas:
-            accounts = mirror.objects['account']
-            mirror.apply(self.zen.write(mirror.server_timestamp, account=[
-                dict(accounts[a], startBalance=change['to'], balance=round(accounts[a]['balance'] + deltas[a], 2))
-                for a, change in self.state['pending']['accounts'].items()]))
-            del self.state['pending']
         mirror.save()
         self.remember(p.handled())
         _write_json(journal, dict(record, status='applied'))
@@ -173,12 +123,15 @@ class App:
         for o in objects:
             got = live.get(o['id'], {})
             problems += [f"{o['id']}: {f} is {got.get(f)!r}, expected {o.get(f)!r}" for f in VERIFY_FIELDS if got.get(f) != o.get(f)]
+        expected = defaultdict(float)
+        for a in p.actions:
+            for account, move in a.moves.items():
+                expected[account] += move
         touched = {o[k] for a in p.actions for o in (*a.before, *a.after) for k in ('incomeAccount', 'outcomeAccount')}
-        touched |= set(deltas)
         for account in touched:
-            now = mirror.objects['account'][account]['balance']
-            if abs(now - balances[account]) >= engine.CENT:
-                problems.append(f'balance of «{book.title(account)}» moved {balances[account]:,.2f} → {now:,.2f}')
+            now, want = mirror.objects['account'][account]['balance'], balances[account] + expected[account]
+            if abs(now - want) >= engine.CENT:
+                problems.append(f'balance of «{book.title(account)}» is {now:,.2f}, expected {want:,.2f}')
         return problems
 
     def log(self, text: str):
@@ -194,7 +147,6 @@ class App:
     def cmd_run(self):
         with self.locked():
             mirror = self.sync()
-            self.finish_pending(mirror)
             book, p = self.plan(mirror)
             if not p.actions:
                 self.remember(p.handled())
@@ -240,16 +192,6 @@ class App:
                         restore.append(dict(old, changed=current.get('changed', 0)))
             if restore:
                 mirror.apply(self.zen.write(mirror.server_timestamp, transaction=restore))
-            deltas = defaultdict(float)
-            for a in record['actions']:
-                if not {o['id'] for o in a['after']} & set(skipped):
-                    for account, delta in a['start_balance_deltas'].items():
-                        deltas[account] -= delta
-            if deltas:
-                accounts = mirror.objects['account']
-                mirror.apply(self.zen.write(mirror.server_timestamp, account=[
-                    dict(accounts[a], startBalance=round(accounts[a]['startBalance'] + d, 2), balance=round(accounts[a]['balance'] + d, 2))
-                    for a, d in deltas.items()]))
             mirror.save()
             self.remember({t['id']: 'undo' for t in created})
             _write_json(path, dict(record, status='undone'))

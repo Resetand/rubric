@@ -28,8 +28,8 @@ def test_every_proposed_write_matches_what_the_user_approved():
     p = engine.plan(engine.Book(before), rules, date(2026, 10, 12), set())
     final = {t['id']: t for t in after['transaction']}
     fields = ('deleted', 'tag', 'incomeAccount', 'outcomeAccount', 'income', 'outcome')
-    # the cleanup left holds alone; converting the ones stuck for good is new work, not a disagreement
-    stuck = {t['id'] for t in before['transaction'] if t.get('hold') and final[t['id']].get('hold') and not final[t['id']]['deleted']}
+    # the cleanup left holds alone; converting them now that holds count as posted is new work, not a disagreement
+    stuck = {t['id'] for t in before['transaction'] if t.get('hold')}
     wrong = [(a.rule, a.text) for a in p.actions if not {t['id'] for t in a.before} <= stuck for o in a.after
              if any((o.get(f) or None) != (final[o['id']].get(f) or None) for f in (('deleted',) if o.get('deleted') else fields))]
     assert len(p.actions) > 800 and not wrong

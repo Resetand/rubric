@@ -1,0 +1,11 @@
+services:
+  autopilot:
+    build: .
+    env_file: .env
+    environment:
+      AUTOPILOT_RULES: /app/rules.toml
+      AUTOPILOT_DATA: /app/data
+    volumes:
+      - ./rules.toml:/app/rules.toml:ro
+      - ./data:/app/data
+    restart: unless-stopped

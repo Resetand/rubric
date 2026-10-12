@@ -1,7 +1,9 @@
 """What the rules ask to write on the current Zenmoney data. Pure: no network, no clock, no files.
 
 Safety rules that hold for every rule type:
-- only transactions imported by a bank plugin, never manual ones, never holds (the bank still replaces them);
+- only transactions imported by a bank plugin, never manual ones;
+- a hold is waited out for `hold_days`, then treated as posted: in Zenmoney T-Bank holds keep the flag for good
+  (no hold has ever been replaced or unflagged by the plugin), while the bank posts them within a day;
 - a transaction is decided once: ids `handled` by previous runs are never looked at again,
   so a later manual edit by the user wins;
 - a transaction is looked at only after `settle_days` and within `lookback_days`;
@@ -17,6 +19,11 @@ from datetime import date, timedelta
 from .config import ConfigError, FxTransferRule, Match, RefundRule, Rules
 
 CENT = 0.005
+COMMON_WORD_PAYEES = 5   # a word in the names of this many payees (city, «ООО», «restoran») tells nothing about the shop
+TRANSLIT = str.maketrans({'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh', 'з': 'z', 'и': 'i',
+                          'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't',
+                          'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y', 'ь': '',
+                          'э': 'e', 'ю': 'yu', 'я': 'ya'})
 
 
 class PlanError(RuntimeError):
@@ -138,8 +145,7 @@ class _Planner:
         self.ignored = {book.account_id(a) for a in rules.ignore_accounts}
         self.decided = set(handled)
         self.out = Plan()
-        self.purchase_days = {(t['outcomeAccount'], t['date']) for t in book.transactions
-                          if kind(t) == 'expense' and payee(t) and not t.get('hold')}
+        self.purchase_days = {(t['outcomeAccount'], t['date']) for t in book.transactions if kind(t) == 'expense' and payee(t)}
         self.by_amount = defaultdict(list)   # (kind, instrument, amount in cents) -> transactions
         for t in book.transactions:
             if kind(t) != 'transfer':
@@ -148,17 +154,34 @@ class _Planner:
         # names used for own money in rules (self transfers): money back from them is never a refund
         self.own_payees = {p.casefold() for r in (*rules.transfers, *rules.categories, *rules.fx_transfers, *rules.notices)
                            for p in r.match.payee}
+        payees = {counterparty(t) for t in book.transactions if kind(t) != 'transfer' and counterparty(t)}
+        word_payees = defaultdict(int)
+        for name in payees:
+            for w in _words(name):
+                word_payees[w] += 1
+        self.common_words = {w for w, n in word_payees.items() if n >= COMMON_WORD_PAYEES}
 
     # --- eligibility -------------------------------------------------------------------------------------------
 
     def eligible(self, t: dict, settle_days: int | None) -> bool:
         settle = self.rules.settle_days if settle_days is None else settle_days
         day = date.fromisoformat(t['date'])
-        return (t['id'] not in self.decided and t.get('source') == 'plugin' and not t.get('hold')
+        return (t['id'] not in self.decided and t.get('source') == 'plugin' and self.hold_waited(t)
                 and kind(t) != 'transfer'
                 and not {t['incomeAccount'], t['outcomeAccount']} & self.ignored
                 and self.today - timedelta(days=self.rules.lookback_days) <= day <= self.today - timedelta(days=settle)
                 and not self.unmerged_transfer(t))
+
+    def hold_waited(self, t: dict) -> bool:
+        return not t.get('hold') or date.fromisoformat(t['date']) <= self.today - timedelta(days=self.rules.hold_days)
+
+    def same_merchant(self, a: str, b: str) -> bool:
+        """«Whoosh» / «WHOOSH_SBP», «Иви» / «ivi.ru», «Яндекс Сервисы» / «Сервисы Яндекса»: no lists of shops."""
+        ca, cb = _compact(a), _compact(b)
+        if ca and cb and (ca == cb or (min(len(ca), len(cb)) >= 3 and (ca.startswith(cb) or cb.startswith(ca)))):
+            return True
+        wa, wb = _words(a) - self.common_words, _words(b) - self.common_words
+        return any(x.startswith(y) or y.startswith(x) for x in wa for y in wb)
 
     def unmerged_transfer(self, t: dict) -> bool:
         """An expense with an income of the same amount on another own account nearby, or the other way round."""
@@ -214,7 +237,7 @@ class _Planner:
         outs = [t for t in self.candidates(rule.match, rule.settle_days) if kind(t) == 'expense']
         ins = [t for t in self.book.transactions
                if kind(t) == 'income' and t['incomeAccount'] in targets and t.get('source') == 'plugin'
-               and not t.get('hold') and t['id'] not in self.decided
+               and self.hold_waited(t) and t['id'] not in self.decided
                and re.search(rule.income_regex, counterparty(t) + ' ' + (t.get('comment') or ''), re.I)]
         pairs = defaultdict(list)
         for o in outs:
@@ -255,38 +278,25 @@ class _Planner:
                             {target: delta} if rule.keep_target_balance else {}))
 
     def refund(self, rule: RefundRule):
-        groups = {name.casefold().replace('ё', 'е'): n for n, group in enumerate(rule.merchant_aliases) for name in group}
-
-        def merchant(text: str) -> str:
-            s = text.casefold().replace('ё', 'е')
-            return f'group:{groups[s]}' if s in groups else re.sub(r'[^0-9a-zа-я]', '', s)
-
-        def same(a: str, b: str) -> bool:
-            if a == b:
-                return True
-            if a.startswith('group:') or b.startswith('group:') or min(len(a), len(b)) < 4:
-                return False
-            return a.startswith(b) or b.startswith(a)   # «Whoosh» / «WHOOSH_SBP», «Boosty» / «Boosty.to»
-
         refunds = [t for t in self.book.transactions if kind(t) == 'income' and counterparty(t) and self.eligible(t, rule.settle_days)
                    and counterparty(t).casefold() not in self.own_payees
                    and not (rule.skip_payee_regex and re.search(rule.skip_payee_regex, counterparty(t)))]
         for r in sorted(refunds, key=lambda t: (t['date'], t['id'])):
-            key, day = merchant(counterparty(r)), date.fromisoformat(r['date'])
+            day = date.fromisoformat(r['date'])
             found = [p for p in self.book.transactions
                      if kind(p) == 'expense' and p['outcomeAccount'] == r['incomeAccount'] and p['id'] not in self.decided
                      and p.get('source') == 'plugin' and abs(p['outcome'] - r['income']) < CENT
-                     and 0 <= (day - date.fromisoformat(p['date'])).days <= rule.max_days and counterparty(p) and same(merchant(counterparty(p)), key)
+                     and 0 <= (day - date.fromisoformat(p['date'])).days <= rule.max_days
+                     and counterparty(p) and self.same_merchant(counterparty(p), counterparty(r))
                      and not self.unmerged_transfer(p)]
-            posted = [p for p in found if not p.get('hold')]
-            nearest = max(posted, key=lambda t: (t['date'], t['id'])) if posted else None
-            newer_hold = any(p.get('hold') and (nearest is None or p['date'] >= nearest['date']) for p in found)
-            if nearest and not newer_hold:
+            ready = [p for p in found if self.hold_waited(p)]
+            nearest = max(ready, key=lambda t: (t['date'], t['id'])) if ready else None
+            # a fresh hold at least as recent as the nearest ready purchase may be the one refunded: wait it out
+            fresh_hold = any(not self.hold_waited(p) and (nearest is None or p['date'] >= nearest['date']) for p in found)
+            if nearest and not fresh_hold:
                 p = nearest   # the nearest earlier purchase: a refund follows its purchase
                 self.add_action(Action(rule.name, f"{self.describe(p)} и возврат {r['date']}", [p, r],
                                 [dict(p, deleted=True), dict(r, deleted=True)]))
-            elif newer_hold:
-                self.add_notice(rule.name, f'{self.describe(r)}: возврат, а такая же покупка все еще на холде — удали пару вручную', [r])
 
     def category(self, rule):
         for t in self.candidates(rule.match, rule.settle_days):
@@ -320,6 +330,14 @@ def _check_names(book: Book, rules: Rules):
     for rule in rules.categories:
         for band in rule.bands:
             book.category_id(band.category)
+
+
+def _compact(name: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', name.casefold().translate(TRANSLIT))
+
+
+def _words(name: str) -> set[str]:
+    return {w for w in re.findall(r'[a-z0-9]+', name.casefold().translate(TRANSLIT)) if len(w) >= 4}
 
 
 def balance_deltas(action: Action) -> dict[str, float]:

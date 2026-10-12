@@ -38,7 +38,6 @@ payee = ["ME"]
 [refund]
 name = "refunds"
 max_days = 60
-merchant_aliases = [["Shop Services", "Services of Shop"]]
 skip_payee_regex = '^[A-Z][a-z]+ [A-Z]\\.$'
 
 [[category]]
@@ -128,17 +127,33 @@ def test_refund_without_a_true_pair_is_left_alone(rules, buy, back):
     assert not plan(rules, buy, back).actions
 
 
-def test_refund_finds_the_merchant_in_the_comment_by_prefix_and_by_alias(rules):
+def test_refund_finds_the_merchant_in_the_comment_by_prefix_shared_word_and_transliteration(rules):
     pairs = [(op('2026-10-01', out=150, payee='Scooter'), op('2026-10-01', inc=150, comment='SCOOTER_SBP')),
-             (op('2026-10-02', out=99, payee='Shop Services'), op('2026-10-02', inc=99, comment='Services of Shop'))]
+             (op('2026-10-02', out=99, payee='Shop Services'), op('2026-10-02', inc=99, comment='Services of Shop')),
+             (op('2026-10-03', out=19, payee='Иви'), op('2026-10-03', inc=19, payee='ivi.ru'))]
     p = plan(rules, *[t for pair in pairs for t in pair])
     assert deleted(p) == {t['id'] for pair in pairs for t in pair}
 
 
-def test_refund_of_a_payment_still_on_hold_is_reported_not_deleted(rules):
-    buy, back = op('2026-10-01', out=430, payee='Games', hold=True), op('2026-10-01', inc=430, payee='Games')
+def test_refund_waits_while_its_purchase_is_a_fresh_hold(rules):
+    buy, back = op('2026-10-10', out=430, payee='Games', hold=True), op('2026-10-10', inc=430, payee='Games')
     p = plan(rules, buy, back)
-    assert not p.actions and p.notices[0].ids == [back['id']]
+    assert not p.actions and not p.notices
+
+
+def test_refund_of_a_purchase_held_for_good_is_deleted(rules):
+    buy, back = op('2026-10-01', out=430, payee='Games', hold=True), op('2026-10-02', inc=430, payee='Games')
+    assert deleted(plan(rules, buy, back)) == {buy['id'], back['id']}
+
+
+def test_refund_is_not_paired_by_a_word_many_payees_share(rules):
+    others = [op('2026-09-20', out=100 + i, payee=f'Shop{i} Samara') for i in range(3)]
+    buy, back = op('2026-10-01', out=900, payee='Pizza Samara'), op('2026-10-03', inc=900, payee='Sushi Samara')
+    assert not plan(rules, *others, buy, back).actions
+
+
+def test_cashback_of_the_same_amount_is_not_a_refund(rules):
+    assert not plan(rules, op('2026-10-01', out=150, payee='Shop'), op('2026-10-03', inc=150, payee='Cashback')).actions
 
 
 # --- roundups ----------------------------------------------------------------------------------------------------------
@@ -199,12 +214,18 @@ def test_fx_transfer_with_two_candidates_is_reported_not_merged(rules):
 @pytest.mark.parametrize('extra, day', [
     ({}, '2026-10-12'),                        # too fresh: settle_days
     ({}, '2026-09-01'),                        # older than lookback_days
-    ({'hold': True}, '2026-10-05'),
+    ({'hold': True}, '2026-10-10'),            # a hold younger than hold_days
     ({'source': 'user'}, '2026-10-05'),
 ])
 def test_operation_outside_the_window_or_not_from_a_bank_is_not_touched(rules, extra, day):
     p = plan(rules, op(day, out=463, payee='Cafe'), op(day, out=37, **extra))
     assert not p.actions
+
+
+def test_hold_older_than_hold_days_is_treated_as_posted(rules):
+    roundup = op('2026-10-05', out=37, hold=True)
+    p = plan(rules, op('2026-10-05', out=463, payee='Cafe', hold=True), roundup)
+    assert written(p)[roundup['id']]['incomeAccount'] == 'savings'
 
 
 def test_operation_handled_by_an_earlier_run_is_not_touched_again(rules):

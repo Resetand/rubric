@@ -67,10 +67,10 @@ class FxTransferRule:
 
 @dataclass(frozen=True)
 class RefundRule:
-    """Delete a purchase together with its full refund: same account, same amount, same merchant."""
+    """Delete a purchase together with its full refund: same account, same amount, same merchant (by name, see
+    engine.same_merchant), the nearest earlier purchase of identical ones."""
     name: str
     max_days: int = 60
-    merchant_aliases: tuple[tuple[str, ...], ...] = ()   # payee names of one merchant, one group per merchant
     skip_payee_regex: str | None = None   # payees that are people, not shops: money back is not a refund
     settle_days: int | None = None
 
@@ -90,6 +90,7 @@ class Rules:
     settle_days: int
     max_writes_per_run: int
     unmerged_transfer_days: int
+    hold_days: int
     ignore_accounts: tuple[str, ...]
     transfers: tuple[TransferRule, ...]
     categories: tuple[CategoryRule, ...]
@@ -103,13 +104,14 @@ def load(path: Path) -> Rules:
         raw = tomllib.loads(path.read_text())
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ConfigError(f'{path}: {error}') from None
-    top = _take(raw, 'rules.toml', {'lookback_days', 'settle_days', 'max_writes_per_run', 'unmerged_transfer_days', 'ignore_accounts',
+    top = _take(raw, 'rules.toml', {'lookback_days', 'settle_days', 'max_writes_per_run', 'unmerged_transfer_days', 'hold_days', 'ignore_accounts',
                                     'transfer', 'category', 'fx_transfer', 'refund', 'notice'})
     return Rules(
         lookback_days=top.get('lookback_days', 30),
         settle_days=top.get('settle_days', 1),
         max_writes_per_run=top.get('max_writes_per_run', 40),
         unmerged_transfer_days=top.get('unmerged_transfer_days', 3),
+        hold_days=top.get('hold_days', 3),
         ignore_accounts=tuple(top.get('ignore_accounts', ())),
         transfers=tuple(_rule(TransferRule, r, 'transfer') for r in top.get('transfer', [])),
         categories=tuple(_rule(CategoryRule, r, 'category') for r in top.get('category', [])),
@@ -128,7 +130,7 @@ def _rule(cls, raw: dict, section: str):
         values['bands'] = tuple(Band(**_take(b, where + ' bands', {'category', 'below'})) for b in values['bands'])
         if not values['bands'] or values['bands'][-1].below is not None:
             raise ConfigError(f'{where}: the last band must have no `below`, so every amount gets a category')
-    for key in ('to_accounts', 'merchant_aliases'):
+    for key in ('to_accounts',):
         if key in values:
             values[key] = tuple(tuple(v) if isinstance(v, list) else v for v in values[key])
     for key in ('income_regex', 'skip_payee_regex'):

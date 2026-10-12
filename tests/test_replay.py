@@ -28,11 +28,13 @@ def test_every_proposed_write_matches_what_the_user_approved():
     p = engine.plan(engine.Book(before), rules, date(2026, 10, 12), set())
     final = {t['id']: t for t in after['transaction']}
     fields = ('deleted', 'tag', 'incomeAccount', 'outcomeAccount', 'income', 'outcome')
-    wrong = [(a.rule, a.text) for a in p.actions for o in a.after
+    # the cleanup left holds alone; converting the ones stuck for good is new work, not a disagreement
+    stuck = {t['id'] for t in before['transaction'] if t.get('hold') and final[t['id']].get('hold') and not final[t['id']]['deleted']}
+    wrong = [(a.rule, a.text) for a in p.actions if not {t['id'] for t in a.before} <= stuck for o in a.after
              if any((o.get(f) or None) != (final[o['id']].get(f) or None) for f in (('deleted',) if o.get('deleted') else fields))]
     assert len(p.actions) > 800 and not wrong
 
 
-def test_clean_history_needs_no_writes():
+def test_clean_history_needs_writes_only_for_holds_stuck_for_good():
     p = engine.plan(engine.Book(load('after.json')), config.load(ROOT / 'rules.toml'), date(2026, 10, 12), set())
-    assert not p.actions
+    assert p.actions and all(t.get('hold') for a in p.actions for t in a.before)

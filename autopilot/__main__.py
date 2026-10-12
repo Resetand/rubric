@@ -182,7 +182,7 @@ class App:
         return problems
 
     def log(self, text: str):
-        print(f'[{datetime.now(self.tz):%Y-%m-%d %H:%M}] {text}', flush=True)
+        print(f'[{datetime.now(self.tz):%Y-%m-%d %H:%M %z}] {text}', flush=True)
 
     # --- commands --------------------------------------------------------------------------------------------------
 

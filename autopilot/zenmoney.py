@@ -25,13 +25,15 @@ class Zenmoney:
         return self._call('diff/', {'currentClientTimestamp': int(time.time()), 'serverTimestamp': server_timestamp})
 
     def write(self, server_timestamp: int, **objects: list[dict]) -> dict:
-        """Send complete objects. The server keeps an object only if its `changed` is newer, so it is set here.
+        """Send complete objects. The server keeps an object only if its `changed` is newer than its own copy.
 
         Writing the same objects twice gives the same state, so a retry after a network error is safe.
         The answer is a diff like `diff()`: everything changed since `server_timestamp`, our objects included.
         """
         now = int(time.time())
-        objects = {kind: [dict(o, changed=now) for o in items] for kind, items in objects.items() if items}
+        # never older than the server copy: an older `changed` makes the server silently keep its own version
+        objects = {kind: [dict(o, changed=max(now, o.get('changed', 0) + 1)) for o in items]
+                   for kind, items in objects.items() if items}
         return self._call('diff/', {'currentClientTimestamp': now, 'serverTimestamp': server_timestamp, **objects})
 
     def _call(self, method: str, body: dict) -> dict:

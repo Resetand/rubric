@@ -89,6 +89,7 @@ class Rules:
     lookback_days: int
     settle_days: int
     max_writes_per_run: int
+    unmerged_transfer_days: int
     ignore_accounts: tuple[str, ...]
     transfers: tuple[TransferRule, ...]
     categories: tuple[CategoryRule, ...]
@@ -102,12 +103,13 @@ def load(path: Path) -> Rules:
         raw = tomllib.loads(path.read_text())
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ConfigError(f'{path}: {error}') from None
-    top = _take(raw, 'rules.toml', {'lookback_days', 'settle_days', 'max_writes_per_run', 'ignore_accounts',
+    top = _take(raw, 'rules.toml', {'lookback_days', 'settle_days', 'max_writes_per_run', 'unmerged_transfer_days', 'ignore_accounts',
                                     'transfer', 'category', 'fx_transfer', 'refund', 'notice'})
     return Rules(
         lookback_days=top.get('lookback_days', 30),
         settle_days=top.get('settle_days', 1),
         max_writes_per_run=top.get('max_writes_per_run', 40),
+        unmerged_transfer_days=top.get('unmerged_transfer_days', 3),
         ignore_accounts=tuple(top.get('ignore_accounts', ())),
         transfers=tuple(_rule(TransferRule, r, 'transfer') for r in top.get('transfer', [])),
         categories=tuple(_rule(CategoryRule, r, 'category') for r in top.get('category', [])),

@@ -5,8 +5,8 @@ Safety rules that hold for every rule type:
 - a transaction is decided once: ids `handled` by previous runs are never looked at again,
   so a later manual edit by the user wins;
 - a transaction is looked at only after `settle_days` and within `lookback_days`;
-- an expense that has an income of the same amount on another own account nearby is an unmerged transfer:
-  Zenmoney merges those itself, no rule touches it;
+- an expense or income with a counterpart of the same amount on another own account nearby is one leg of an
+  unmerged transfer: Zenmoney merges those itself, no rule touches either leg;
 - every action keeps every account balance as it is (checked here, an action that would move a balance is a bug).
 """
 import re
@@ -16,8 +16,11 @@ from datetime import date, timedelta
 
 from .config import ConfigError, FxTransferRule, Match, RefundRule, Rules
 
-UNMERGED_TRANSFER_DAYS = 2
 CENT = 0.005
+
+
+class PlanError(RuntimeError):
+    """A bug: the planner produced something that breaks its own guarantees. Nothing is written."""
 
 
 def kind(t: dict) -> str:
@@ -51,11 +54,13 @@ class Book:
         self.accounts = {a['id']: a for a in snapshot['account']}
         self.rates = {i['id']: i['rate'] for i in snapshot['instrument']}
         tags = {t['id']: t for t in snapshot['tag']}
-        self.categories = {}
+        self.categories, self.ambiguous = {}, set()
         for t in tags.values():
             parent = tags.get(t.get('parent'))
             path = f"{parent['title']} / {t['title']}" if parent else t['title']
             if not t.get('archive'):
+                if path in self.categories:
+                    self.ambiguous.add(path)
                 self.categories[path] = t['id']
         self.transactions = [t for t in snapshot['transaction'] if not t['deleted']]
 
@@ -68,8 +73,9 @@ class Book:
         return found[0]
 
     def category_id(self, path: str) -> str:
-        if path not in self.categories:
-            raise ConfigError(f'category {path!r} not found in Zenmoney (use "Parent / Child")')
+        if path not in self.categories or path in self.ambiguous:
+            problem = 'is not unique' if path in self.ambiguous else 'not found (use "Parent / Child")'
+            raise ConfigError(f'category {path!r} {problem} in Zenmoney')
         return self.categories[path]
 
     def title(self, account_id: str) -> str:
@@ -134,10 +140,14 @@ class _Planner:
         self.out = Plan()
         self.purchase_days = {(t['outcomeAccount'], t['date']) for t in book.transactions
                           if kind(t) == 'expense' and payee(t) and not t.get('hold')}
-        self.incomes = defaultdict(list)   # (instrument, amount in cents) -> incomes
+        self.by_amount = defaultdict(list)   # (kind, instrument, amount in cents) -> transactions
         for t in book.transactions:
-            if kind(t) == 'income':
-                self.incomes[(t['incomeInstrument'], round(t['income'] * 100))].append(t)
+            if kind(t) != 'transfer':
+                instrument = t['incomeInstrument'] if kind(t) == 'income' else t['outcomeInstrument']
+                self.by_amount[(kind(t), instrument, round(amount(t) * 100))].append(t)
+        # names used for own money in rules (self transfers): money back from them is never a refund
+        self.own_payees = {p.casefold() for r in (*rules.transfers, *rules.categories, *rules.fx_transfers, *rules.notices)
+                           for p in r.match.payee}
 
     # --- eligibility -------------------------------------------------------------------------------------------
 
@@ -151,12 +161,16 @@ class _Planner:
                 and not self.unmerged_transfer(t))
 
     def unmerged_transfer(self, t: dict) -> bool:
-        if kind(t) != 'expense':
+        """An expense with an income of the same amount on another own account nearby, or the other way round."""
+        k = kind(t)
+        if k == 'transfer':
             return False
+        other = 'income' if k == 'expense' else 'expense'
+        instrument = t['incomeInstrument'] if k == 'income' else t['outcomeInstrument']
         day = date.fromisoformat(t['date'])
-        return any(i['incomeAccount'] != t['outcomeAccount'] and i['incomeAccount'] not in self.ignored
-                   and abs((date.fromisoformat(i['date']) - day).days) <= UNMERGED_TRANSFER_DAYS
-                   for i in self.incomes[(t['outcomeInstrument'], round(t['outcome'] * 100))])
+        return any(account_of(c) != account_of(t) and account_of(c) not in self.ignored
+                   and abs((date.fromisoformat(c['date']) - day).days) <= self.rules.unmerged_transfer_days
+                   for c in self.by_amount[(other, instrument, round(amount(t) * 100))])
 
     def matches(self, t: dict, m: Match) -> bool:
         k, text, value = kind(t), payee(t), amount(t)
@@ -180,7 +194,8 @@ class _Planner:
 
     def add_action(self, action: Action):
         ids = [t['id'] for t in action.before]
-        assert not set(ids) & self.decided, f'{action.rule}: a transaction is used twice'
+        if set(ids) & self.decided:
+            raise PlanError(f'{action.rule}: a transaction is used twice')
         self.decided.update(ids)
         self.out.actions.append(action)
 
@@ -254,27 +269,32 @@ class _Planner:
             return a.startswith(b) or b.startswith(a)   # «Whoosh» / «WHOOSH_SBP», «Boosty» / «Boosty.to»
 
         refunds = [t for t in self.book.transactions if kind(t) == 'income' and counterparty(t) and self.eligible(t, rule.settle_days)
+                   and counterparty(t).casefold() not in self.own_payees
                    and not (rule.skip_payee_regex and re.search(rule.skip_payee_regex, counterparty(t)))]
         for r in sorted(refunds, key=lambda t: (t['date'], t['id'])):
             key, day = merchant(counterparty(r)), date.fromisoformat(r['date'])
             found = [p for p in self.book.transactions
                      if kind(p) == 'expense' and p['outcomeAccount'] == r['incomeAccount'] and p['id'] not in self.decided
                      and p.get('source') == 'plugin' and abs(p['outcome'] - r['income']) < CENT
-                     and 0 <= (day - date.fromisoformat(p['date'])).days <= rule.max_days and counterparty(p) and same(merchant(counterparty(p)), key)]
+                     and 0 <= (day - date.fromisoformat(p['date'])).days <= rule.max_days and counterparty(p) and same(merchant(counterparty(p)), key)
+                     and not self.unmerged_transfer(p)]
             posted = [p for p in found if not p.get('hold')]
-            if posted:
-                p = max(posted, key=lambda t: (t['date'], t['id']))   # the nearest earlier purchase: a refund follows its purchase
+            nearest = max(posted, key=lambda t: (t['date'], t['id'])) if posted else None
+            newer_hold = any(p.get('hold') and (nearest is None or p['date'] >= nearest['date']) for p in found)
+            if nearest and not newer_hold:
+                p = nearest   # the nearest earlier purchase: a refund follows its purchase
                 self.add_action(Action(rule.name, f"{self.describe(p)} и возврат {r['date']}", [p, r],
                                 [dict(p, deleted=True), dict(r, deleted=True)]))
-            elif found:
-                self.add_notice(rule.name, f'{self.describe(r)}: возврат, а покупка все еще на холде — удали пару вручную', [r])
+            elif newer_hold:
+                self.add_notice(rule.name, f'{self.describe(r)}: возврат, а такая же покупка все еще на холде — удали пару вручную', [r])
 
     def category(self, rule):
         for t in self.candidates(rule.match, rule.settle_days):
             value = amount(t)
             band = next(b for b in rule.bands if b.below is None or value < b.below)
             tag = self.book.category_id(band.category)
-            if t.get('tag') == [tag]:
+            ours = {self.book.category_id(b.category) for b in rule.bands}
+            if t.get('tag') == [tag] or (t.get('tag') and not set(t['tag']) <= ours):   # right, or chosen by hand
                 self.out.unchanged[t['id']] = rule.name
                 self.decided.add(t['id'])
             else:
@@ -314,4 +334,5 @@ def balance_deltas(action: Action) -> dict[str, float]:
 
 def _assert_balances_kept(action: Action):
     moved = {a: d for a, d in balance_deltas(action).items() if abs(d) >= CENT}
-    assert not moved, f'{action.rule}: {action.text} would move balances {moved}'
+    if moved:
+        raise PlanError(f'{action.rule}: {action.text} would move balances {moved}')

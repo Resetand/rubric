@@ -22,6 +22,8 @@ def load(name: str) -> dict:
 def test_every_proposed_write_matches_what_the_user_approved():
     before, after = load('before.json'), load('after.json')
     before['tag'], before['account'] = after['tag'], after['account']   # the category tree was built during the cleanup
+    for t in before['transaction']:
+        t['tag'] = None   # old categories look chosen by hand to the category rule; a fresh import has none
     rules = dataclasses.replace(config.load(ROOT / 'rules.toml'), lookback_days=400)
     p = engine.plan(engine.Book(before), rules, date(2026, 10, 12), set())
     final = {t['id']: t for t in after['transaction']}

@@ -198,8 +198,7 @@ class App:
             book, p = self.plan(mirror)
             if not p.actions:
                 self.remember(p.handled())
-                if p.notices:
-                    self.log(report(p))
+                self.log(report(p) or 'nothing to do')
                 return
             problems = self.apply(mirror, book, p)
         text = report(p)
@@ -208,6 +207,7 @@ class App:
         self.log(text)
 
     def cmd_loop(self, minutes: int):
+        self.log(f'started: a run every {minutes} minutes')
         while True:
             try:
                 self.cmd_run()

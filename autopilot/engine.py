@@ -14,6 +14,7 @@ Safety rules that hold for every rule type:
   every other balance stays as it is. Checked here: anything else is a bug.
 """
 import re
+from collections.abc import Iterable
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -124,18 +125,24 @@ class Plan:
 
 
 def plan(book: Book, rules: Rules, today: date, handled: set[str]) -> Plan:
-    _check_names(book, rules)
+    """Each rule stands on its own: one whose account or category is not in Zenmoney is skipped and reported,
+    the others still run. Names are resolved up front, so a renamed account disables its rule even on a day
+    nothing matches, instead of surfacing weeks later."""
     p = _Planner(book, rules, today, handled)
     for rule in rules.fx_transfers:
-        p.fx_transfer(rule)
+        if p.usable(rule, accounts=(rule.match.account, *rule.to_accounts)):
+            p.fx_transfer(rule)
     for rule in rules.transfers:
-        p.transfer(rule)
+        if p.usable(rule, accounts=(rule.match.account, rule.to_account)):
+            p.transfer(rule)
     if rules.refund:
         p.refund(rules.refund)
     for rule in rules.categories:
-        p.category(rule)
+        if p.usable(rule, accounts=(rule.match.account,), categories=[b.category for b in rule.bands]):
+            p.category(rule)
     for rule in rules.notices:
-        p.notice(rule)
+        if p.usable(rule, accounts=(rule.match.account,)):
+            p.notice(rule)
     for action in p.out.actions:
         _assert_balances_kept(action)
     return p.out
@@ -144,9 +151,9 @@ def plan(book: Book, rules: Rules, today: date, handled: set[str]) -> Plan:
 class _Planner:
     def __init__(self, book: Book, rules: Rules, today: date, handled: set[str]):
         self.book, self.rules, self.today = book, rules, today
-        self.ignored = {book.account_id(a) for a in rules.ignore_accounts}
         self.decided = set(handled)
         self.out = Plan()
+        self.ignored = self._ignored_accounts()
         self.purchase_days = {(t['outcomeAccount'], t['date']) for t in book.transactions if kind(t) == 'expense' and payee(t)}
         self.by_amount = defaultdict(list)   # (kind, instrument, amount in cents) -> transactions
         for t in book.transactions:
@@ -164,6 +171,29 @@ class _Planner:
         self.common_words = {w for w, n in word_payees.items() if n >= COMMON_WORD_PAYEES}
 
     # --- eligibility -------------------------------------------------------------------------------------------
+
+    def usable(self, rule, accounts: Iterable[str | None] = (), categories: Iterable[str] = ()) -> bool:
+        """False, with a notice, when a name the rule needs is not in Zenmoney (renamed, deleted, duplicated)."""
+        try:
+            for name in accounts:
+                if name:
+                    self.book.account_id(name)
+            for path in categories:
+                self.book.category_id(path)
+        except ConfigError as error:
+            self.out.notices.append(Notice('rules.toml', f'правило «{rule.name}» отключено, пока не исправишь rules.toml: {error}', []))
+            return False
+        return True
+
+    def _ignored_accounts(self) -> set[str]:
+        """Accounts never touched. One that is gone from Zenmoney has nothing to protect: reported, not fatal."""
+        ids = set()
+        for name in self.rules.ignore_accounts:
+            try:
+                ids.add(self.book.account_id(name))
+            except ConfigError as error:
+                self.out.notices.append(Notice('rules.toml', f'ignore_accounts: {error}; нечего игнорировать, убери его из rules.toml', []))
+        return ids
 
     def eligible(self, t: dict, settle_days: int | None) -> bool:
         settle = self.rules.settle_days if settle_days is None else settle_days
@@ -314,23 +344,6 @@ class _Planner:
     def notice(self, rule):
         for t in self.candidates(rule.match, rule.settle_days):
             self.add_notice(rule.name, f'{self.describe(t)}: {rule.text}', [t])
-
-
-def _check_names(book: Book, rules: Rules):
-    """Resolve every name up front: a renamed account or category stops the run even if nothing matches today."""
-    for name in rules.ignore_accounts:
-        book.account_id(name)
-    for rule in (*rules.transfers, *rules.categories, *rules.fx_transfers, *rules.notices):
-        if rule.match.account:
-            book.account_id(rule.match.account)
-    for rule in rules.transfers:
-        book.account_id(rule.to_account)
-    for rule in rules.fx_transfers:
-        for name in rule.to_accounts:
-            book.account_id(name)
-    for rule in rules.categories:
-        for band in rule.bands:
-            book.category_id(band.category)
 
 
 def _compact(name: str) -> str:

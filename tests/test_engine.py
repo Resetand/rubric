@@ -253,11 +253,25 @@ def test_large_self_transfer_is_reported_once(rules):
 
 # --- configuration -----------------------------------------------------------------------------------------------------
 
-def test_renamed_account_stops_the_run(rules, tmp_path):
+def test_rule_with_a_renamed_account_is_skipped_and_reported_while_the_others_run(rules, tmp_path):
     path = tmp_path / 'renamed.toml'
     path.write_text(RULES.replace('to_account = "Savings"', 'to_account = "Old savings"'))
-    with pytest.raises(config.ConfigError, match='Old savings'):
-        engine.plan(book(), config.load(path), TODAY, set())
+    buy, back = op('2026-10-01', out=500, payee='Shop'), op('2026-10-10', inc=500, payee='Shop')
+    p = engine.plan(book(buy, back, op('2026-10-10', out=37)), config.load(path), TODAY, set())
+    assert deleted(p) == {buy['id'], back['id']}, 'the refund rule still works'
+    assert not any(o['id'] not in deleted(p) for o in written(p).values()), 'the roundup rule wrote nothing'
+    [notice] = [n for n in p.notices if 'Old savings' in n.text]
+    assert 'roundups' in notice.text and not notice.ids
+
+
+def test_ignored_account_missing_in_zenmoney_is_reported_but_does_not_stop_the_run(rules, tmp_path):
+    """An account that no longer exists has nothing to ignore; the rest of the rules keep working."""
+    path = tmp_path / 'gone.toml'
+    path.write_text(RULES.replace('ignore_accounts = ["Service"]', 'ignore_accounts = ["Service", "Deleted robot"]'))
+    p = engine.plan(book(op('2026-10-10', out=463, payee='Cafe'), op('2026-10-10', out=37)), config.load(path), TODAY, set())
+    assert written(p), 'the roundup is still converted'
+    assert any('Deleted robot' in n.text for n in p.notices)
+    assert not any(n.ids for n in p.notices if 'Deleted robot' in n.text), 'nothing to remember as handled'
 
 
 def test_unknown_key_in_rules_is_an_error(tmp_path):

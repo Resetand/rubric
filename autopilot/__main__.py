@@ -160,12 +160,19 @@ class App:
 
     def cmd_loop(self, minutes: int):
         self.log(f'started: a run every {minutes} minutes')
+        last_error = None
         while True:
             try:
                 self.cmd_run()
+                last_error = None
             except Exception as error:   # noqa: BLE001 — a long-running loop logs and goes on
-                self.log(f'error: {type(error).__name__}: {error}')
-                traceback.print_exc()
+                text = f'error: {type(error).__name__}: {error}'
+                if text == last_error:
+                    self.log(text + ' (same as the run before)')   # one line per repeat keeps the log readable
+                else:
+                    self.log(text)
+                    traceback.print_exc()
+                last_error = text
             time.sleep(minutes * 60)
 
     def cmd_undo(self, path: Path):

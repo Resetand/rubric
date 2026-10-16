@@ -1,5 +1,4 @@
 """Runs against a fake Zenmoney server: writes, the check after them, an interrupted run, undo."""
-import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
